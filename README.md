@@ -45,3 +45,13 @@ This integration is a quick and dirty fix, and any suggestions for improvements 
 # Disclaimer
 This integration is not officially supported by Home Assistant or Daikin. Use it at your own risk. The creators of this integration are not responsible for any issues that may arise from its use.
 This README template should help users understand how to install, configure, and use the integration, as well as set the right expectations regarding its temporary nature and supported models. If there are any other specifics or additional sections you'd like to include, feel free to let me know!
+
+
+# Comment by wolfwind
+I forked and updated this Home Assistant integration because the Daikin network controller frequently disconnects, which caused the original local_daikin entities to fail.
+
+This update introduces connection error handling with automatic retries. After a certain number of retries, it pauses until the next polling cycle, preventing entities from breaking.
+
+In addition, the program structure has been refactored to better align with Home Assistant’s development practices.
+
+This update was completed with the assistance of ChatGPT.
