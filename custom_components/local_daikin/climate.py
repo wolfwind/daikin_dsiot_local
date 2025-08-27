@@ -523,7 +523,8 @@ class LocalDaikinClimate(ClimateEntity):
     def update_attribute(self, request: dict) -> None:
         """送設定命令（失敗時退避），成功後刷新一次狀態。"""
         try:
-            resp = self._http("PUT", request)
+            # multireq 寫入也走 POST（較通用）
+            resp = self._http("POST", request)
             # 有些機種是以 2004 表示設定成功
             code = resp["responses"][0].get("rsc")
             if code != 2004:
@@ -563,6 +564,9 @@ class LocalDaikinClimate(ClimateEntity):
             if hex_target:
                 attrs.append(DaikinAttribute("p_0B", hex_target, ["e_1002","e_3001"], "/dsiot/edge/adr_0100.dgc_status"))
         self.update_attribute(DaikinRequest(attrs).serialize())
+        await self.hass.async_add_executor_job(
+            self.update_attribute, DaikinRequest(attrs).serialize()
+        )
 
 
     # ========== 葉片定位：實體服務 ==========
@@ -581,7 +585,13 @@ class LocalDaikinClimate(ClimateEntity):
             if hexh:
                 attrs.append(DaikinAttribute(h_attr, hexh, ["e_1002","e_3001"], "/dsiot/edge/adr_0100.dgc_status"))
         if len(attrs) > 1:
-            self.update_attribute(DaikinRequest(attrs).serialize())
+            await self.hass.async_add_executor_job(
+                self.update_attribute, DaikinRequest(attrs).serialize()
+            )
+
+    async def async_added_to_hass(self) -> None:
+        # 初始化 MAC 做為 unique_id（非阻塞）
+        self.hass.async_create_task(self.initialize_unique_id(self.hass))
 
     def set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
@@ -675,17 +685,20 @@ async def async_setup_entry(hass, entry, async_add_entities):
     ent = LocalDaikinClimate(host)
     async_add_entities([ent], update_before_add=True)
 
-    # 註冊 entity service：climate.set_cool_humidity_control
     platform = entity_platform.current_platform.get()
-    platform.async_register_entity_service(
-        "set_cool_humidity_control",
-        vol.Schema({
-            vol.Required("enabled"): bool,
-            vol.Optional("target"): vol.In([50, 55, 60]),
-            vol.Optional("continuous", default=False): bool,
-        }),
-        "async_set_cool_humidity_control",
-    )
+    reg = hass.data.setdefault(DOMAIN, {}).get("services_registered")
+    if not reg:
+        hass.data[DOMAIN]["services_registered"] = True
+        # 註冊 entity service：climate.set_cool_humidity_control
+        platform.async_register_entity_service(
+            "set_cool_humidity_control",
+            vol.Schema({
+                vol.Required("enabled"): bool,
+                vol.Optional("target"): vol.In([50, 55, 60]),
+                vol.Optional("continuous", default=False): bool,
+            }),
+            "async_set_cool_humidity_control",
+        )
 
     # 註冊：葉片定位（至少一個參數）
     platform.async_register_entity_service(
