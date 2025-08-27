@@ -37,7 +37,7 @@ class BaseDaikinSelect(SelectEntity):
         self._climate = None
         self._attr_name = f"Daikin {name_suffix} ({ip})"
         self._attr_unique_id = f"daikin_{unique_id_suffix}_{ip}"
-        self._attr_should_poll = True
+        self._attr_should_poll = False
 
     async def async_added_to_hass(self):
         self._climate = self._hass.data["local_daikin"][self._entry_id].get("climate_entity")

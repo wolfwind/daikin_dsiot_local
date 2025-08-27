@@ -30,9 +30,10 @@ class DaikinOutdoorTempSensor(SensorEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        entity = self._get_climate_entity()
-        entity.update()
-        self._state = entity.extra_state_attributes.get("outside_temperature")
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            return
+        self._state = st.attributes.get("outside_temperature")
 
     @property
     def native_value(self):
@@ -69,9 +70,10 @@ class DaikinEnergyTodaySensor(SensorEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        climate = self._get_climate_entity()
-        climate.update()
-        self._state = climate.extra_state_attributes.get("energy_today")
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            return
+        self._state = st.attributes.get("energy_today")
 
     @property
     def native_value(self):
@@ -91,9 +93,11 @@ class DaikinCurrentHumiditySensor(SensorEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        entity = self._get_climate_entity()
-        entity.update()
-        self._state = entity.current_humidity
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            return
+        self._state = st.attributes.get("current_humidity") or st.attributes.get("humidity") or None
+
 
     @property
     def native_value(self):
@@ -121,9 +125,10 @@ class DaikinIndoorTempSensor(SensorEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        entity = self._get_climate_entity()
-        entity.update()
-        self._state = entity.current_temperature
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            return
+        self._state = st.attributes.get("current_temperature")
 
     @property
     def native_value(self):
@@ -151,9 +156,10 @@ class DaikinRuntimeTodaySensor(SensorEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        entity = self._get_climate_entity()
-        entity.update()
-        self._state = entity.extra_state_attributes.get("runtime_today")
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            return
+        self._state = st.attributes.get("runtime_today")
 
     @property
     def native_value(self):
@@ -181,9 +187,10 @@ class DaikinTargetTempSensor(SensorEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        entity = self._get_climate_entity()
-        entity.update()
-        self._state = entity.target_temperature
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            return
+        self._state = st.attributes.get("temperature") or st.attributes.get("target_temperature")
 
     @property
     def native_value(self):

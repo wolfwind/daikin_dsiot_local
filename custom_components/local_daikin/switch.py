@@ -32,10 +32,13 @@ class DaikinPowerSwitch(SwitchEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        entity = self._get_climate_entity()
-        entity.update()
-        _LOGGER.info(f"[PowerSwitch] Climate hvac_mode: {entity.hvac_mode}")
-        self._state = entity.hvac_mode != "off"
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            self._attr_available = False
+            self._state = False
+            return
+        self._attr_available = st.state not in ("unavailable", "unknown")
+        self._state = str(st.state).lower() != "off"
 
     def turn_on(self, **kwargs):
         entity = self._get_climate_entity()
@@ -76,10 +79,16 @@ class DaikinQuietFanSwitch(SwitchEntity):
         return self._hass.data["local_daikin"][self._entry_id]["climate_entity"]
 
     def update(self):
-        """Sync with current fan mode from the climate entity."""
-        entity = self._get_climate_entity()
-        entity.update()
-        self._state = entity.fan_mode == "Quiet"
+        """Sync with current fan mode (read from state machine)."""
+        st = self._hass.states.get(self._get_climate_entity().entity_id)
+        if not st:
+            self._attr_available = False
+            self._state = False
+            return
+        self._attr_available = st.state not in ("unavailable", "unknown")
+        fm = st.attributes.get("fan_mode")
+        fm_str = str(getattr(fm, "value", fm)).lower() if fm is not None else ""
+        self._state = (fm_str == "quiet")
 
     def turn_on(self, **kwargs):
         """Set fan mode to Quiet."""
