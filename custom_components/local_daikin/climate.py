@@ -1,5 +1,14 @@
 import logging
 import requests
+
+##20250827 修正輪詢失敗後的錯誤處置
+import time
+from requests.exceptions import RequestException
+
+DEFAULT_TIMEOUT = 5                       # HTTP 逾時秒數
+BACKOFFS = [10, 60, 120, 300, 600]        # 退避階梯，避免開機還沒連上網路狀態
+##20250827 修正輪詢失敗後的錯誤處置
+
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
 from homeassistant.components.climate.const import (
     HVACMode,
@@ -33,7 +42,7 @@ class DaikinAttribute:
     path: list[str]
     to: str
 
-    def format(self) -> str:
+    def format(self) -> dict:
         return {"pn": self.name, "pv": self.value}
 
 class HAFanMode(StrEnum):
@@ -152,7 +161,13 @@ class DaikinRequest:
 async def async_setup_entry(hass, entry, async_add_entities):
     ip = entry.data["ip_address"]
     entity = LocalDaikin(ip)
-    await hass.async_add_executor_job(entity.update)
+    ##20250827 修正輪詢失敗後的錯誤處置
+    # await hass.async_add_executor_job(entity.update)
+    try:
+        await hass.async_add_executor_job(entity.update)
+    except Exception as err:
+        _LOGGER.warning("Initial update failed: %s (will retry later)", err)
+    ##20250827 修正輪詢失敗後的錯誤處置
     await entity.initialize_unique_id(hass)
 
     # 👇 Register entity for use by switch.py
@@ -177,6 +192,9 @@ class LocalDaikin(ClimateEntity):
         self._mac = None
         self._max_temp = 30 # may need some logic to set this based on the device ID
         self._min_temp = 10
+        self._fail_count = 0
+        self._next_retry = 0.0
+        self._attr_available = True
 
         self._ip = ip_address
         self._name = f"Local Daikin ({ip_address})"
@@ -225,10 +243,23 @@ class LocalDaikin(ClimateEntity):
                 {"op": 2, "to": "/dsiot/edge.adp_i"}
             ]
         }
-        response = await hass.async_add_executor_job(lambda: requests.post(self.url, json=payload))
-        response.raise_for_status()
-        data = response.json()
-        self._mac = format_mac(self.find_value_by_pn(data, "/dsiot/edge.adp_i", "adp_i", "mac"))
+
+        ##20250827 修正輪詢失敗後的錯誤處置
+        def _call():
+            return requests.post(self.url, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        try:
+            response = await hass.async_add_executor_job(_call)
+            response.raise_for_status()
+            data = response.json()
+            self._mac = format_mac(self.find_value_by_pn(
+                data, "/dsiot/edge.adp_i", "adp_i", "mac"
+            ))
+        except (RequestException, ValueError) as err:
+            _LOGGER.warning("Init unique_id failed: %s (fallback to ip-based, will retry on next update)", err)
+            # 讓 unique_id 至少可用；之後 update 成功可再把 self._mac 更新成真實 MAC
+            self._mac = self._attr_unique_id
+        ##20250827 修正輪詢失敗後的錯誤處置
 
     @property
     def device_info(self):
@@ -276,8 +307,15 @@ class LocalDaikin(ClimateEntity):
         return True
 
     def set_fan_mode(self, fan_mode: str):
-        mode = FAN_MODE_MAP[fan_mode]
-        name = HVAC_MODE_TO_FAN_SPEED_ATTR_NAME.get(self.hvac_mode)
+        ##20250827 修正輪詢失敗後的錯誤處置
+        try:
+            mode = FAN_MODE_MAP[HAFanMode(fan_mode)]
+        except Exception:
+            _LOGGER.warning("Unknown fan_mode %s, fallback to AUTO", fan_mode)
+            mode = FAN_MODE_MAP[HAFanMode.FAN_AUTO]
+        name = HVAC_MODE_TO_FAN_SPEED_ATTR_NAME.get(self._hvac_mode)
+        #name = HVAC_MODE_TO_FAN_SPEED_ATTR_NAME.get(self.hvac_mode)
+        ##20250827 修正輪詢失敗後的錯誤處置
 
         # If in dry mode for example, you cannot set the fan speed. So we ignore anything we cant find in this map.
         if name is not None:
@@ -287,11 +325,13 @@ class LocalDaikin(ClimateEntity):
             self._fan_mode = HAFanMode.FAN_AUTO
 
     def set_swing_mode(self, swing_mode: str):
-        if self.hvac_mode == HVACMode.OFF:
+        ##20250827 修正輪詢失敗後的錯誤處置
+        if self._hvac_mode == HVACMode.OFF:   # ← 用 Enum 比較
             return
         vertical_axis_command = TURN_OFF_SWING_AXIS if swing_mode in (SWING_OFF, SWING_HORIZONTAL) else TURN_ON_SWING_AXIS
         horizontal_axis_command = TURN_OFF_SWING_AXIS if swing_mode in (SWING_OFF, SWING_VERTICAL) else TURN_ON_SWING_AXIS
-        vertical_attr_name, horizontal_attr_name = HVAC_MODE_TO_SWING_ATTR_NAMES[self.hvac_mode]
+        vertical_attr_name, horizontal_attr_name = HVAC_MODE_TO_SWING_ATTR_NAMES[self._hvac_mode]
+        ##20250827 修正輪詢失敗後的錯誤處置
         self.update_attribute(
             DaikinRequest(
                 [
@@ -341,7 +381,9 @@ class LocalDaikin(ClimateEntity):
 
     @property
     def unique_id(self):
-        return self._mac
+        ##20250827 修正輪詢失敗後的錯誤處置
+        return self._mac or self._attr_unique_id
+        ##20250827 修正輪詢失敗後的錯誤處置
 
     @staticmethod
     def find_value_by_pn(data:dict, fr: str, *keys):
@@ -372,15 +414,42 @@ class LocalDaikin(ClimateEntity):
 
     def set_temperature(self, temperature: float, **kwargs):
         _LOGGER.info("Temp change to " + str(temperature) + " requested.")
-        attr_name = HVAC_TO_TEMP_HEX.get(self.hvac_mode)
+        ##20250827 修正輪詢失敗後的錯誤處置
+        #attr_name = HVAC_TO_TEMP_HEX.get(self.hvac_mode)
+        attr_name = HVAC_TO_TEMP_HEX.get(self._hvac_mode)
         if attr_name is None:
-            _LOGGER.error(f"Cannot set temperature in {self.hvac} mode.")
+            _LOGGER.error("Cannot set temperature in %s mode.", self._hvac_mode)
             return
+        ##20250827 修正輪詢失敗後的錯誤處置
 
         temperature_hex = format(int(temperature * 2), '02x') 
         temp_attr = DaikinAttribute(attr_name, temperature_hex, ["e_1002", "e_3001"], "/dsiot/edge/adr_0100.dgc_status")
         self.update_attribute(DaikinRequest([temp_attr]).serialize())
 
+    
+    ##20250827 修正輪詢失敗後的錯誤處置
+    def update_attribute(self, request: dict, *keys) -> None:
+        _LOGGER.debug(request)
+        try:
+            response = self._http("PUT", request)
+            _LOGGER.debug(response)
+            if response['responses'][0].get('rsc') != 2004:
+                _LOGGER.error("Unexpected response code: %s", response)
+                return
+            # 寫入後再抓一次狀態（成功才做）
+            self.update()
+        except (RequestException, ValueError) as err:
+            # 寫入失敗也不要把例外往外丟，以免整個平台洗版或卡死
+            self._attr_available = False
+            _LOGGER.warning("update_attribute failed: %s", err)
+            # 啟動退避（沿用上一段的機制）
+            now = time.monotonic()
+            self._fail_count = min(self._fail_count + 1, len(BACKOFFS))
+            backoff = BACKOFFS[self._fail_count - 1]
+            self._next_retry = now + backoff
+            return
+
+    """
     def update_attribute(self, request: dict, *keys) -> None:
         _LOGGER.info(request)
         response = requests.put(self.url, json=request).json()
@@ -389,6 +458,8 @@ class LocalDaikin(ClimateEntity):
             raise Exception(f"An exception occured:\n{response}")
 
         self.update()
+    """
+    ##20250827 修正輪詢失敗後的錯誤處置
 
     def _update_state(self, state: bool):
         attribute = DaikinAttribute("p_01", "00" if not state else "01", ["e_1002", "e_A002"], "/dsiot/edge/adr_0100.dgc_status")
@@ -406,7 +477,10 @@ class LocalDaikin(ClimateEntity):
 
 
         # The number of zeros in the response seems strange. Don't have time to work out, so this should work
-        vertical_attr_name, horizontal_attr_name = HVAC_MODE_TO_SWING_ATTR_NAMES[self.hvac_mode]
+        ##20250827 修正輪詢失敗後的錯誤處置
+        #vertical_attr_name, horizontal_attr_name = HVAC_MODE_TO_SWING_ATTR_NAMES[self.hvac_mode]
+        vertical_attr_name, horizontal_attr_name = HVAC_MODE_TO_SWING_ATTR_NAMES[self._hvac_mode]
+        ##20250827 修正輪詢失敗後的錯誤處置
         vertical = "F" in self.find_value_by_pn(data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", vertical_attr_name)
         horizontal = "F" in self.find_value_by_pn(data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", horizontal_attr_name)
 
@@ -423,55 +497,113 @@ class LocalDaikin(ClimateEntity):
     def current_humidity(self) -> int:
         return self._current_humidity
 
+    ##20250827 修正輪詢失敗後的錯誤處置
+    @property
+    def available(self) -> bool:
+        return getattr(self, "_attr_available", True)
+
+    def _http(self, method: str, payload: dict):
+        """
+        小幫手：統一發 HTTP + 逾時 + 狀態碼檢查 + JSON 解析。
+        成功回傳 dict；失敗 raise (由呼叫端決定是否吃掉)。
+        """
+        if method == "POST":
+            r = requests.post(self.url, json=payload, timeout=DEFAULT_TIMEOUT)
+        elif method == "PUT":
+            r = requests.put(self.url, json=payload, timeout=DEFAULT_TIMEOUT)
+        else:
+            raise ValueError(f"Unsupported method {method}")
+        r.raise_for_status()
+        return r.json()
 
     def update(self):
         """Fetch new state data for the entity."""
+        # 退避：若尚未到下一次重試時間，直接略過這輪輪詢
+        now = time.monotonic()
+        if now < self._next_retry:
+            return
+
         payload = {
             "requests": [
                 {"op": 2, "to": "/dsiot/edge/adr_0100.dgc_status?filter=pv,pt,md"},
                 {"op": 2, "to": "/dsiot/edge/adr_0200.dgc_status?filter=pv,pt,md"},
-                {"op": 2, "to": "/dsiot/edge/adr_0100.i_power.week_power?filter=pv,pt,md"}
+                {"op": 2, "to": "/dsiot/edge/adr_0100.i_power.week_power?filter=pv,pt,md"},
             ]
         }
 
-        response = requests.post(self.url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        _LOGGER.info(data)
+        try:
+            data = self._http("POST", payload)
+            _LOGGER.debug("Update payload: %s", data)
 
-        # Set the HVAC mode.
-        is_off = self.find_value_by_pn(data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_A002", "p_01") == "00"
-        self._hvac_mode = HVACMode.OFF if is_off else MODE_MAP[self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_3001', 'p_01')]
+            # ==== 以下維持原邏輯 ====
+            is_off = self.find_value_by_pn(
+                data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_A002", "p_01"
+            ) == "00"
+            self._hvac_mode = HVACMode.OFF if is_off else MODE_MAP[
+                self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_3001', 'p_01')
+            ]
 
-        self._outside_temperature = self.hex_to_temp(self.find_value_by_pn(data, '/dsiot/edge/adr_0200.dgc_status', 'dgc_status', 'e_1003', 'e_A00D', 'p_01'))
+            self._outside_temperature = self.hex_to_temp(
+                self.find_value_by_pn(data, '/dsiot/edge/adr_0200.dgc_status', 'dgc_status', 'e_1003', 'e_A00D', 'p_01')
+            )
 
-        # Only set the target temperature if this mode allows it. Otherwise, it should be set to none.
-        name = HVAC_TO_TEMP_HEX.get(self._hvac_mode)
-        if name is not None:
-            try:
-                self._target_temperature = self.hex_to_temp(self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_3001', name))
-            except Exception:
-                _LOGGER.warning("No target temperature found, setting fallback.")
-                self._target_temperature = 22.0  # default
-        else:
-            self._target_temperature = None        
+            name = HVAC_TO_TEMP_HEX.get(self._hvac_mode)
+            if name is not None:
+                try:
+                    self._target_temperature = self.hex_to_temp(
+                        self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_3001', name)
+                    )
+                except Exception:
+                    _LOGGER.warning("No target temperature found, setting fallback.")
+                    self._target_temperature = 22.0
+            else:
+                self._target_temperature = None
 
-        # For some reason, this hex value does not get the 'divide by 2' treatment. My only assumption as to why this might be is because the level of granularity
-        # for this temperature is limited to integers. So the passed divisor is 1.
-        self._current_temperature = self.hex_to_temp(self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_A00B', 'p_01'), divisor=1)
+            self._current_temperature = self.hex_to_temp(
+                self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_A00B', 'p_01'),
+                divisor=1
+            )
 
-        # If we cannot find a name for this hvac_mode's fan speed, it is automatic. This is the case for dry.
-        fan_mode_key_name = HVAC_MODE_TO_FAN_SPEED_ATTR_NAME.get(self._hvac_mode)
-        if fan_mode_key_name is not None:
-            hex_value = self.find_value_by_pn(data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", fan_mode_key_name)
-            self._fan_mode = REVERSE_FAN_MODE_MAP[hex_value]
-        else:
-            self._fan_mode = HAFanMode.FAN_AUTO
+            fan_mode_key_name = HVAC_MODE_TO_FAN_SPEED_ATTR_NAME.get(self._hvac_mode)
+            if fan_mode_key_name is not None:
+                hex_value = self.find_value_by_pn(
+                    data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", fan_mode_key_name
+                )
+                #self._fan_mode = REVERSE_FAN_MODE_MAP[hex_value]
+                # 防未知回傳值 fallback 成 AUTO
+                self._fan_mode = REVERSE_FAN_MODE_MAP.get(hex_value, HAFanMode.FAN_AUTO)
+            else:
+                self._fan_mode = HAFanMode.FAN_AUTO
 
-        self._current_humidity = int(self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_A00B', 'p_02'), 16)
+            self._current_humidity = int(
+                self.find_value_by_pn(data, '/dsiot/edge/adr_0100.dgc_status', 'dgc_status', 'e_1002', 'e_A00B', 'p_02'),
+                16
+            )
 
-        if not self.hvac_mode == HVACMode.OFF:
-            self._swing_mode = self.get_swing_state(data)
-        
-        self._energy_today = self.find_value_by_pn(data, '/dsiot/edge/adr_0100.i_power.week_power', 'week_power', 'datas')[-1]
-        self._runtime_today = self.find_value_by_pn(data, '/dsiot/edge/adr_0100.i_power.week_power', 'week_power', 'today_runtime')
+            if self._hvac_mode != HVACMode.OFF:
+                self._swing_mode = self.get_swing_state(data)
+
+            self._energy_today = self.find_value_by_pn(
+                data, '/dsiot/edge/adr_0100.i_power.week_power', 'week_power', 'datas'
+            )[-1]
+            self._runtime_today = self.find_value_by_pn(
+                data, '/dsiot/edge/adr_0100.i_power.week_power', 'week_power', 'today_runtime'
+            )
+            # ==== 以上維持原邏輯 ====
+
+            # 成功：回復 available，清除退避
+            self._attr_available = True
+            self._fail_count = 0
+            self._next_retry = 0.0
+
+        except (RequestException, ValueError, KeyError, TypeError, Exception) as err:
+            # 一併吃掉解析/鍵值錯誤與自訂 Exception，避免冒泡卡死
+            # 失敗：標記 unavailable + 退避，不拋例外
+            self._attr_available = False
+            self._fail_count = min(self._fail_count + 1, len(BACKOFFS))
+            backoff = BACKOFFS[self._fail_count - 1]
+            self._next_retry = now + backoff
+            _LOGGER.warning("Local Daikin update failed: %s; backing off %ss", err, backoff)
+            return
+
+    ##20250827 修正輪詢失敗後的錯誤處置
