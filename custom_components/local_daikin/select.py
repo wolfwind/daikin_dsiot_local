@@ -18,14 +18,17 @@ _LOGGER = logging.getLogger(__name__)
 # -------------------------
 
 def _get_host(entry: ConfigEntry) -> str:
-    # 兼容舊鍵名
-    return entry.data.get("host") or entry.data.get("ip") or entry.data.get("ip_address")  # type: ignore[return-value]
+    host = _get_host(entry)
+    return entry.title or f"Local Daikin ({host})"
 
+def _get_title(entry: ConfigEntry) -> str:
+    host = _get_host(entry)
+    return entry.title or f"Local Daikin ({host})"
 
-def _build_device_info(host: str) -> DeviceInfo:
+def _build_device_info(host: str, title: str) -> DeviceInfo:
     return DeviceInfo(
         identifiers={(DOMAIN, f"daikin-{host}")},
-        name=f"Local Daikin ({host})",
+        name=title,
         manufacturer="Daikin",
         model="Local API (/dsiot)",
     )
@@ -37,12 +40,12 @@ class _BaseDaikinSelect(SelectEntity):
     _attr_should_poll = False
     _attr_has_entity_name = True
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
         self._hass = hass
         self._entry_id = entry_id
         self._host = host
         self._climate_entity_id_cache: Optional[str] = None
-        self._attr_device_info = _build_device_info(host)
+        self._attr_device_info = _build_device_info(host, title)
 
     # ---- 找到 climate entity_id 並快取 ----
     def _resolve_climate_entity_id(self) -> Optional[str]:
@@ -355,11 +358,12 @@ class DaikinHorizontalVaneSelect(_BaseDaikinSelect):
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     host = _get_host(entry)
+    title = _get_title(entry)
     entities: list[SelectEntity] = [
-        DaikinHVACModeSelect(hass, entry.entry_id, host),
-        DaikinFanSpeedSelect(hass, entry.entry_id, host),
-        DaikinCoolHumidityTargetSelect(hass, entry.entry_id, host),
-        DaikinVerticalVaneSelect(hass, entry.entry_id, host),
-        DaikinHorizontalVaneSelect(hass, entry.entry_id, host),
+        DaikinHVACModeSelect(hass, entry.entry_id, host, title),
+        DaikinFanSpeedSelect(hass, entry.entry_id, host, title),
+        DaikinCoolHumidityTargetSelect(hass, entry.entry_id, host, title),
+        DaikinVerticalVaneSelect(hass, entry.entry_id, host, title),
+        DaikinHorizontalVaneSelect(hass, entry.entry_id, host, title),
     ]
     async_add_entities(entities, update_before_add=True)

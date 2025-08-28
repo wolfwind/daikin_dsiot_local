@@ -4,6 +4,7 @@ import requests
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Optional
+from . import DOMAIN
 
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
 from homeassistant.components.climate.const import (
@@ -14,8 +15,9 @@ from homeassistant.components.climate.const import (
     SWING_HORIZONTAL,
 )
 from homeassistant.const import UnitOfTemperature
-from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.device_registry import format_mac, DeviceInfo
 from homeassistant.helpers import entity_platform
+from homeassistant.helpers import config_validation as cv
 import voluptuous as vol
 
 _LOGGER = logging.getLogger(__name__)
@@ -182,9 +184,9 @@ class DaikinRequest:
 
 # ===== 主要 Entity =====
 class LocalDaikinClimate(ClimateEntity):
-    def __init__(self, ip_address: str) -> None:
+    def __init__(self, ip_address: str, name: str | None = None) -> None:
         self._ip = ip_address
-        self._name = f"Local Daikin ({ip_address})"
+        self._name = name or f"Local Daikin ({ip_address})"
         self._attr_unique_id = f"daikin_climate_{ip_address}"
         self.url = f"http://{ip_address}/dsiot/multireq"
 
@@ -229,6 +231,16 @@ class LocalDaikinClimate(ClimateEntity):
     @property
     def name(self) -> str:
         return self._name
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        # 裝置名稱也跟著 entry.title
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"daikin-{self._ip}")},
+            name=self._name,
+            manufacturer="Daikin",
+            model="Local API (/dsiot)",
+        )
 
     @property
     def temperature_unit(self) -> str:
@@ -682,7 +694,8 @@ class LocalDaikinClimate(ClimateEntity):
 # ---- 在平台 setup 時註冊本實體的「濕度控制」服務 ----
 async def async_setup_entry(hass, entry, async_add_entities):
     host = entry.data.get("host") or entry.data.get("ip") or entry.data.get("ip_address")
-    ent = LocalDaikinClimate(host)
+    title = entry.title or f"Local Daikin ({host})"
+    ent = LocalDaikinClimate(host, name=title)
     async_add_entities([ent], update_before_add=True)
 
     platform = entity_platform.current_platform.get()
@@ -692,7 +705,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
         # 註冊 entity service：climate.set_cool_humidity_control
         platform.async_register_entity_service(
             "set_cool_humidity_control",
-            vol.Schema({
+            cv.make_entity_service_schema({
                 vol.Required("enabled"): bool,
                 vol.Optional("target"): vol.In([50, 55, 60]),
                 vol.Optional("continuous", default=False): bool,
@@ -703,7 +716,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # 註冊：葉片定位（至少一個參數）
     platform.async_register_entity_service(
         "set_vane_position",
-        vol.Schema({
+        cv.make_entity_service_schema({
             vol.Optional("vertical"): vol.In([
                 "Auto","Swing","Circulation","Off",
                 "1","2","3","4","5","6",
