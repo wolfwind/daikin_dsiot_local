@@ -18,8 +18,15 @@ _LOGGER = logging.getLogger(__name__)
 # -------------------------
 
 def _get_host(entry: ConfigEntry) -> str:
-    host = _get_host(entry)
-    return entry.title or f"Local Daikin ({host})"
+    # 讀取 host，向下相容舊鍵名 ip/ip_address 以及 options
+    return (
+        entry.data.get("host")
+        or entry.data.get("ip")
+        or entry.data.get("ip_address")
+        or entry.options.get("host")
+        or entry.options.get("ip")
+        or entry.options.get("ip_address")
+    )
 
 def _get_title(entry: ConfigEntry) -> str:
     host = _get_host(entry)

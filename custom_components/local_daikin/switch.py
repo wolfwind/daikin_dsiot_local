@@ -22,8 +22,15 @@ SCAN_INTERVAL = timedelta(seconds=60)
 # -------------------------
 
 def _get_host(entry: ConfigEntry) -> str:
-    host = _get_host(entry)
-    return entry.title or f"Local Daikin ({host})"
+    # 讀取 host，向下相容舊鍵名 ip/ip_address 以及 options
+    return (
+        entry.data.get("host")
+        or entry.data.get("ip")
+        or entry.data.get("ip_address")
+        or entry.options.get("host")
+        or entry.options.get("ip")
+        or entry.options.get("ip_address")
+    )
 
 def _get_title(entry: ConfigEntry) -> str:
     host = _get_host(entry)
@@ -91,8 +98,8 @@ class _BaseDaikinSwitch(SwitchEntity):
 class DaikinPowerSwitch(_BaseDaikinSwitch):
     _attr_name = "Power"
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_power_{host}"
         self._state = False
 
@@ -143,8 +150,8 @@ class DaikinPowerSwitch(_BaseDaikinSwitch):
 class DaikinQuietFanSwitch(_BaseDaikinSwitch):
     _attr_name = "Quiet Fan"
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_quiet_fan_{host}"
         self._state = False
 
@@ -193,8 +200,8 @@ class DaikinQuietFanSwitch(_BaseDaikinSwitch):
 class DaikinCoolHumiditySwitch(_BaseDaikinSwitch):
     _attr_name = "Cool Humidity Control"
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_cool_humidity_{host}"
         self._state = False
 
@@ -209,22 +216,27 @@ class DaikinCoolHumiditySwitch(_BaseDaikinSwitch):
             self._state = False
             return
         self._attr_available = st.state not in ("unavailable", "unknown")
-        p0c = st.attributes.get("p_0C")  # "00"=off, "01"=on, "06"=continuous
-        self._state = p0c in ("01", "06")
+        preset = st.attributes.get("preset_mode")
+        if preset is not None:
+            self._state = (str(preset).lower() == "humidity_control")
+        else:
+            self._state = bool(st.attributes.get("cool_humidity_enabled"))
 
     async def async_turn_on(self, **kwargs) -> None:
         ent_id = self._resolve_climate_entity_id()
         if not ent_id:
             return
-        # 預設目標：沿用目前值或 55%
+        # 預設目標：沿用目前值或 55%，用內建 climate.set_humidity
         st = self._get_climate_state()
         target = st.attributes.get("cool_humidity_target") if st else None
-        if target not in (50, 55, 60):
+        try:
+            target = int(target)
+        except Exception:
             target = 55
         await self._hass.services.async_call(
             "climate",
-            "set_cool_humidity_control",
-            {"entity_id": ent_id, "enabled": True, "target": target},
+            "set_humidity",
+            {"entity_id": ent_id, "humidity": target},
             blocking=True,
         )
 
@@ -232,10 +244,11 @@ class DaikinCoolHumiditySwitch(_BaseDaikinSwitch):
         ent_id = self._resolve_climate_entity_id()
         if not ent_id:
             return
+        # 使用內建 climate.set_preset_mode 將濕度控制關閉
         await self._hass.services.async_call(
             "climate",
-            "set_cool_humidity_control",
-            {"entity_id": ent_id, "enabled": False},
+            "set_preset_mode",
+            {"entity_id": ent_id, "preset_mode": "none"},
             blocking=True,
         )
 

@@ -1,9 +1,13 @@
+from __future__ import annotations
+from functools import partial
+
 import logging
 import time
 import requests
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Optional
+
 from . import DOMAIN
 
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
@@ -57,6 +61,15 @@ FAN_MODE_MAP: dict[str, str] = {
 }
 REVERSE_FAN_MODE_MAP: dict[str, str] = {v: k for k, v in FAN_MODE_MAP.items()}
 
+# 目標溫度所在欄位（多數 DSIoT：COOL→p_02, HEAT→p_03；AUTO 先沿用 COOL）
+HVAC_TO_TEMP_HEX: dict[HVACMode, str | None] = {
+    HVACMode.COOL: "p_02",
+    HVACMode.HEAT: "p_03",
+    HVACMode.AUTO: "p_02",
+    HVACMode.FAN_ONLY: None,
+    HVACMode.DRY: None,
+}
+
 # 各模式對應其「風速屬性名」；有些模式（如 DRY）不允許改風速 → None
 HVAC_MODE_TO_FAN_SPEED_ATTR_NAME: dict[HVACMode, str | None] = {
     HVACMode.COOL: "p_09",
@@ -64,15 +77,6 @@ HVAC_MODE_TO_FAN_SPEED_ATTR_NAME: dict[HVACMode, str | None] = {
     HVACMode.FAN_ONLY: "p_09",
     HVACMode.AUTO: "p_09",
     HVACMode.DRY: None,
-}
-
-# 各模式對應其目標溫度屬性名（℃×2 的十六進位字串）
-HVAC_TO_TEMP_HEX: dict[HVACMode, str | None] = {
-    HVACMode.COOL: "p_02",
-    HVACMode.HEAT: "p_03",
-    HVACMode.AUTO: "p_1D",  # 有些機種支援 AUTO 設溫
-    HVACMode.DRY: None,
-    HVACMode.FAN_ONLY: None,
 }
 
 # 各模式對應（垂直, 水平）葉片屬性名（最常見：COOL 用 p_05/p_06）
@@ -86,15 +90,6 @@ HVAC_MODE_TO_SWING_ATTR_NAMES: dict[HVACMode, tuple[str | None, str | None]] = {
 
 TURN_OFF_SWING_AXIS = "000000"
 TURN_ON_SWING_AXIS = "0F0000"
-
-# ---- 冷房濕度控制（p_0C / p_0B）對照 ----
-HUMIDITY_TARGET_TO_HEX = {50: "0A", 55: "0B", 60: "0C"}
-HEX_TO_HUMIDITY_TARGET = {v: k for k, v in HUMIDITY_TARGET_TO_HEX.items()}
-HUMIDITY_CONTROL_MAP = {
-    "00": "off",
-    "01": "on",
-    "06": "continuous",
-}
 
 # ---- 葉片位置（選單用）----
 # 垂直：新增友善名稱；同時保留數字 1..6 當同義詞
@@ -151,7 +146,10 @@ class DaikinRequest:
             for req in payload["requests"]:
                 if req.get("to") == to:
                     return req
-            req = {"op": 3, "to": to, "pc": {"pch": []}}
+            # 需包含根節點的 pn，例如 '/dsiot/edge/adr_0100.dgc_status' → pn='dgc_status'
+            last = to.rsplit("/", 1)[-1]           # 'adr_0100.dgc_status'
+            root_pn = last.split(".")[-1] or last  # 'dgc_status'
+            req = {"op": 3, "to": to, "pc": {"pn": root_pn, "pch": []}}
             payload["requests"].append(req)
             return req
 
@@ -194,16 +192,18 @@ class LocalDaikinClimate(ClimateEntity):
         self._hvac_mode: HVACMode = HVACMode.OFF
         self._fan_mode: str = HAFanMode.FAN_AUTO
         self._swing_mode: str = SWING_OFF
-        self._target_temperature: float | None = None
+        self._target_temperature: float | None = 26.0  # 預設 26°C，避免 UI 初始為未知而隱藏滑桿
         self._current_temperature: float | None = None
         self._current_humidity: int | None = None
         self._outside_temperature: float | None = None
         self._energy_today: float | None = None
         self._runtime_today: int | None = None
         self._mac: str | None = None
-        # 濕度控制狀態（原始十六進位；供 switch 讀取）
-        self._p0c_humidity_ctrl: Optional[str] = None   # "00"/"01"/"06"
-        self._p0b_humidity_target: Optional[str] = None # "0A"/"0B"/"0C"
+
+        # 濕度控制（新版：e_3003）
+        self._cool_humidity_enabled: Optional[bool] = None
+        self._cool_humidity_target: Optional[int] = None
+
         # 葉片位置（原始 hex，及屬性名）
         self._vane_vert_hex: str | None = None
         self._vane_horz_hex: str | None = None
@@ -226,6 +226,9 @@ class LocalDaikinClimate(ClimateEntity):
             HAFanMode.FAN_LEVEL1, HAFanMode.FAN_LEVEL2, HAFanMode.FAN_LEVEL3, HAFanMode.FAN_LEVEL4, HAFanMode.FAN_LEVEL5
         ]
         self._attr_swing_modes = [SWING_OFF, SWING_BOTH, SWING_VERTICAL, SWING_HORIZONTAL]
+        # 告訴前端可調溫，每步 0.5℃
+        self._attr_target_temperature_step = 0.5
+        self._attr_precision = 0.5
 
     # ===== HA 規定的屬性/方法 =====
     @property
@@ -298,8 +301,10 @@ class LocalDaikinClimate(ClimateEntity):
     def supported_features(self) -> int:
         return (
             ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.TARGET_HUMIDITY
             | ClimateEntityFeature.FAN_MODE
             | ClimateEntityFeature.SWING_MODE
+            | ClimateEntityFeature.PRESET_MODE
         )
 
     @property
@@ -312,12 +317,10 @@ class LocalDaikinClimate(ClimateEntity):
             "runtime_today": self._runtime_today,
         }
         # 冷房濕度控制（額外曝露）
-        if self._p0c_humidity_ctrl is not None:
-            attrs["p_0C"] = self._p0c_humidity_ctrl
-            attrs["cool_humidity_control"] = HUMIDITY_CONTROL_MAP.get(self._p0c_humidity_ctrl, "off")
-        if self._p0b_humidity_target is not None:
-            attrs["p_0B"] = self._p0b_humidity_target
-            attrs["cool_humidity_target"] = HEX_TO_HUMIDITY_TARGET.get(self._p0b_humidity_target)
+        if self._cool_humidity_enabled is not None:
+            attrs["cool_humidity_enabled"] = self._cool_humidity_enabled
+        if self._cool_humidity_target is not None:
+            attrs["cool_humidity_target"] = self._cool_humidity_target
         # 暴露目前模式對應之葉片欄位與數值（供 select 讀）
         if self._vane_vert_attr and self._vane_vert_hex is not None:
             attrs[self._vane_vert_attr] = self._vane_vert_hex
@@ -331,6 +334,27 @@ class LocalDaikinClimate(ClimateEntity):
     @property
     def unique_id(self) -> str | None:
         return self._mac or self._attr_unique_id
+
+    # ---- 內建濕度 API 對應 ----
+    @property
+    def target_humidity(self) -> int | None:
+        # 映射到 e_3003.p_1A（0~100）
+        return self._cool_humidity_target
+
+    @property
+    def current_humidity(self) -> int | None:
+        return self._current_humidity
+
+    @property
+    def preset_modes(self) -> list[str] | None:
+        # 用 preset 代表「是否啟用冷房濕度控制」
+        return ["none", "humidity_control"]
+
+    @property
+    def preset_mode(self) -> str | None:
+        if self._cool_humidity_enabled:
+            return "humidity_control"
+        return "none"
 
     # ===== 對裝置的讀/寫 =====
     def _http(self, method: str, payload: dict) -> dict:
@@ -425,18 +449,27 @@ class LocalDaikinClimate(ClimateEntity):
                     data, "/dsiot/edge/adr_0200.dgc_status", "dgc_status", "e_1003", "e_A00D", "p_01"
                 )
             )
-            temp_attr = HVAC_TO_TEMP_HEX.get(self._hvac_mode)
-            if temp_attr:
+            # 讀取目標溫度：主欄位 + 容錯候選，讀不到就保留上次值，避免 UI 隱藏滑桿
+            prev = self._target_temperature
+            candidates = []
+            if self._hvac_mode == HVACMode.COOL:
+                candidates = ["p_02", "p_04", "p_03"]
+            elif self._hvac_mode == HVACMode.HEAT:
+                candidates = ["p_03", "p_02", "p_04"]
+            elif self._hvac_mode == HVACMode.AUTO:
+                candidates = ["p_02", "p_03", "p_04"]
+            found = None
+            for attr in candidates:
                 try:
-                    self._target_temperature = self.hex_to_temp(
-                        self.find_value_by_pn(
-                            data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", temp_attr
-                        )
+                    val = self.find_value_by_pn(
+                        data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", attr
                     )
+                    if val is not None:
+                        found = self.hex_to_temp(val)
+                        break
                 except Exception:
-                    self._target_temperature = None
-            else:
-                self._target_temperature = None
+                    continue
+            self._target_temperature = found if found is not None else prev
 
             self._current_temperature = self.hex_to_temp(
                 self.find_value_by_pn(
@@ -504,19 +537,19 @@ class LocalDaikinClimate(ClimateEntity):
             except Exception:
                 self._runtime_today = None
 
-            # 冷房濕度控制（只要裝置回傳就解析，不強制檢查模式）
+            # 冷房濕度控制（正確欄位：e_3003.p_2C 開關、e_3003.p_1A 目標%）
             try:
-                self._p0c_humidity_ctrl = self.find_value_by_pn(
-                    data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", "p_0C"
-                )
+                p2c = self.find_value_by_pn(data, "/dsiot/edge/adr_0100.dgc_status",
+                                            "dgc_status", "e_1002", "e_3003", "p_2C")
+                self._cool_humidity_enabled = (p2c == "01")
             except Exception:
-                self._p0c_humidity_ctrl = None
+                self._cool_humidity_enabled = None
             try:
-                self._p0b_humidity_target = self.find_value_by_pn(
-                    data, "/dsiot/edge/adr_0100.dgc_status", "dgc_status", "e_1002", "e_3001", "p_0B"
-                )
+                p1a = self.find_value_by_pn(data, "/dsiot/edge/adr_0100.dgc_status",
+                                            "dgc_status", "e_1002", "e_3003", "p_1A")
+                self._cool_humidity_target = int(p1a, 16) if p1a is not None else None
             except Exception:
-                self._p0b_humidity_target = None
+                self._cool_humidity_target = None
 
             # 成功：恢復 available / 清退避
             self._attr_available = True
@@ -539,51 +572,117 @@ class LocalDaikinClimate(ClimateEntity):
             resp = self._http("POST", request)
             # 有些機種是以 2004 表示設定成功
             code = resp["responses"][0].get("rsc")
-            if code != 2004:
-                _LOGGER.error("Unexpected response: %s", resp)
-                return
-            # 寫入後抓一次最新狀態
+            if code not in (2000, 2004):
+                # 簡單檢測：若 payload 內同時含有 p_2D 與其他 p_*，嘗試兩階段提交
+                try:
+                    reqs = request.get("requests", [])
+                    needs_split = False
+                    for r in reqs:
+                        pc = r.get("pc", {})
+                        # 粗略掃描是否同時出現 p_2D 與其他屬性
+                        found_commit = False
+                        found_others = False
+                        stack = [pc]
+                        while stack:
+                            node = stack.pop()
+                            for ch in node.get("pch", []):
+                                if ch.get("pn") == "p_2D":
+                                    found_commit = True
+                                elif ch.get("pn", "").startswith("p_") and ch.get("pn") != "p_2D":
+                                    found_others = True
+                                stack.append(ch)
+                        if found_commit and found_others:
+                            needs_split = True
+                            break
+                    if needs_split:
+                        # 1) 先送「去掉 p_2D」的版本
+                        def strip_p2d(node):
+                            node["pch"] = [ch for ch in node.get("pch", []) if ch.get("pn") != "p_2D"]
+                            for ch in node["pch"]:
+                                strip_p2d(ch)
+                        first = {"requests": []}
+                        for r in reqs:
+                            r1 = {"op": r["op"], "to": r["to"], "pc": {"pn": r["pc"].get("pn"), "pch": []}}
+                            # 深拷貝後移除 p_2D
+                            import copy
+                            r1["pc"] = copy.deepcopy(r["pc"])
+                            strip_p2d(r1["pc"])
+                            first["requests"].append(r1)
+                        self._http("POST", first)
+                        # 2) 再送只含 p_2D 的版本
+                        def keep_only_p2d(node):
+                            node["pch"] = [ch for ch in node.get("pch", []) if ch.get("pn") == "p_2D"]
+                            for ch in node["pch"]:
+                                keep_only_p2d(ch)
+                        second = {"requests": []}
+                        for r in reqs:
+                            r2 = {"op": r["op"], "to": r["to"], "pc": {"pn": r["pc"].get("pn"), "pch": []}}
+                            import copy
+                            r2["pc"] = copy.deepcopy(r["pc"])
+                            keep_only_p2d(r2["pc"])
+                            second["requests"].append(r2)
+                        self._http("POST", second)
+                    else:
+                        _LOGGER.error("Unexpected response (no split fallback applied): %s", resp)
+                        return
+                except Exception:
+                    _LOGGER.error("Unexpected response: %s", resp)
+                    _LOGGER.error("Request: %s", request)
+                    return
             self.update()
         except Exception as err:
             self._attr_available = False
             self._fail_count = min(self._fail_count + 1, len(BACKOFFS))
             self._next_retry = time.monotonic() + BACKOFFS[self._fail_count - 1]
             _LOGGER.warning("update_attribute failed: %s", err)
+            _LOGGER.warning("Request: %s", request)
 
     # -------- 冷房濕度控制：實體服務 --------
-    async def async_set_cool_humidity_control(
-        self,
-        enabled: bool,
-        target: Optional[int] = None,
-        continuous: Optional[bool] = False,
-    ) -> None:
-        """
-        設定冷房濕度控制：
-          enabled=False  -> p_0C="00"
-          enabled=True   -> p_0C="01"（或 continuous=True -> "06"）
-          target 可選 50/55/60（對應 p_0B）
-        """
-        # 組 p_0C
-        if not enabled:
-            p0c = "00"
-        else:
-            p0c = "06" if continuous else "01"
-        attrs = [DaikinAttribute("p_2D", "02", ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
-                 DaikinAttribute("p_0C", p0c, ["e_1002","e_3001"], "/dsiot/edge/adr_0100.dgc_status")]
-        # 組 p_0B（若提供）
+    async def async_set_cool_humidity_control(self, enabled: bool, target: Optional[int] = None, continuous: Optional[bool] = False):
+        # 新版：p_2C（開關），p_1A（0~100 %）
+        hex_target = None
         if target is not None:
-            hex_target = HUMIDITY_TARGET_TO_HEX.get(int(target))
-            if hex_target:
-                attrs.append(DaikinAttribute("p_0B", hex_target, ["e_1002","e_3001"], "/dsiot/edge/adr_0100.dgc_status"))
-        self.update_attribute(DaikinRequest(attrs).serialize())
-        await self.hass.async_add_executor_job(
-            self.update_attribute, DaikinRequest(attrs).serialize()
-        )
+            target = max(0, min(100, int(target)))
+            hex_target = f"{target:02X}"  # 50 -> "32", 55 -> "37", 60 -> "3C"
+        attrs = [
+            DaikinAttribute("p_2D", "02", ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+            DaikinAttribute("p_2C", "01" if enabled else "00", ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+        ]
+        if hex_target is not None:
+            attrs.append(DaikinAttribute("p_1A", hex_target, ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"))
+        await self.hass.async_add_executor_job(self.update_attribute, DaikinRequest(attrs).serialize())
 
+
+    # === 內建服務：設定目標濕度 ===
+    def set_humidity(self, humidity: int) -> None:
+        # 將 0~100 的整數寫入 e_3003.p_1A；並確保 p_2C=01（啟用濕度控制）
+        value = max(0, min(100, int(humidity)))
+        hexv = f"{value:02X}"
+        req = DaikinRequest([
+            DaikinAttribute("p_2D", "02", ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+            DaikinAttribute("p_2C", "01", ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+            DaikinAttribute("p_1A", hexv, ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+        ]).serialize()
+        self.update_attribute(req)
+
+    async def async_set_humidity(self, humidity: int) -> None:
+        await self.hass.async_add_executor_job(self.set_humidity, humidity)
+
+    # === 內建服務：設定預設模式（用來開/關濕度控制）===
+    def set_preset_mode(self, preset_mode: str) -> None:
+        on = (str(preset_mode).lower() == "humidity_control")
+        req = DaikinRequest([
+            DaikinAttribute("p_2D", "02", ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+            DaikinAttribute("p_2C", "01" if on else "00", ["e_1002","e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+        ]).serialize()
+        self.update_attribute(req)
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        await self.hass.async_add_executor_job(self.set_preset_mode, preset_mode)
 
     # ========== 葉片定位：實體服務 ==========
     async def async_set_vane_position(self, vertical: str | None = None, horizontal: str | None = None) -> None:
-        """設定葉片位置：vertical 可為 Auto/Swing/Circulation/1..6/Off；horizontal 可為 Off/Swing"""
+        """設定葉片位置：vertical 可為 Auto/Swing/Circulation/1..6/Off；horizontal 可為 Off/Swing/固定角度"""
         if not vertical and not horizontal:
             return
         v_attr, h_attr = HVAC_MODE_TO_SWING_ATTR_NAMES.get(self._hvac_mode, (None, None))
@@ -607,11 +706,11 @@ class LocalDaikinClimate(ClimateEntity):
 
     def set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            req = DaikinRequest([
+            # 關機：很多機型不接受帶 p_2D，單獨送電源 OFF 即可
+            req_off = DaikinRequest([
                 DaikinAttribute("p_01", "00", ["e_1002", "e_A002"], "/dsiot/edge/adr_0100.dgc_status"),
-                DaikinAttribute("p_2D", "01", ["e_1002", "e_3003"], "/dsiot/edge/adr_0100.dgc_status"),  # 停止
             ]).serialize()
-            self.update_attribute(req)
+            self.update_attribute(req_off)
             return
 
         mode_hex = None
@@ -623,12 +722,17 @@ class LocalDaikinClimate(ClimateEntity):
             _LOGGER.error("Unknown HVAC mode: %s", hvac_mode)
             return
 
-        req = DaikinRequest([
-            DaikinAttribute("p_01", "01", ["e_1002", "e_A002"], "/dsiot/edge/adr_0100.dgc_status"),  # 開機
-            DaikinAttribute("p_01", mode_hex, ["e_1002", "e_3001"], "/dsiot/edge/adr_0100.dgc_status"),
-            DaikinAttribute("p_2D", "02", ["e_1002", "e_3003"], "/dsiot/edge/adr_0100.dgc_status"),  # 設定變更
+        # 開機改兩段送：先電源 ON，再設定模式+提交，避免有些韌體對同包多欄位挑剔
+        req_on = DaikinRequest([
+            DaikinAttribute("p_01", "01", ["e_1002", "e_A002"], "/dsiot/edge/adr_0100.dgc_status"),
         ]).serialize()
-        self.update_attribute(req)
+        self.update_attribute(req_on)
+
+        req_mode = DaikinRequest([
+            DaikinAttribute("p_01", mode_hex, ["e_1002", "e_3001"], "/dsiot/edge/adr_0100.dgc_status"),
+            DaikinAttribute("p_2D", "02", ["e_1002", "e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
+        ]).serialize()
+        self.update_attribute(req_mode)
 
     def set_fan_mode(self, fan_mode: str) -> None:
         name = HVAC_MODE_TO_FAN_SPEED_ATTR_NAME.get(self._hvac_mode)
@@ -650,14 +754,19 @@ class LocalDaikinClimate(ClimateEntity):
         if not attr:
             _LOGGER.error("Cannot set temperature in %s mode.", self._hvac_mode)
             return
-        # ℃×2 → 兩位十六進位字串（左側補 0）
+        # ℃×2 → 兩位十六進位字串（左側補 0）；本機型只需單一位元組
         v = max(self._min_temp, min(self._max_temp, float(temp)))
-        hexv = f"{int(round(v * 2)) & 0xFF:02X}0000"
+        hexv = f"{int(round(v * 2)) & 0xFF:02X}"
         req = DaikinRequest([
             DaikinAttribute("p_2D", "02", ["e_1002", "e_3003"], "/dsiot/edge/adr_0100.dgc_status"),
             DaikinAttribute(attr, hexv, ["e_1002", "e_3001"], "/dsiot/edge/adr_0100.dgc_status"),
         ]).serialize()
         self.update_attribute(req)
+    async def async_set_temperature(self, **kwargs) -> None:
+        """供前端/服務呼叫的 async 版本。"""
+        # HA 會把 entity_id 等塞進 kwargs；executor_job 不吃 kwargs，改用 partial
+        kwargs.pop("entity_id", None)
+        await self.hass.async_add_executor_job(partial(self.set_temperature, **kwargs))
 
     def set_swing_mode(self, swing_mode: str) -> None:
         v_attr, h_attr = HVAC_MODE_TO_SWING_ATTR_NAMES.get(self._hvac_mode, (None, None))
@@ -691,40 +800,42 @@ class LocalDaikinClimate(ClimateEntity):
             _LOGGER.warning("Init unique_id failed: %s; fallback to IP-based unique_id", err)
             self._mac = self._attr_unique_id
 
-# ---- 在平台 setup 時註冊本實體的「濕度控制」服務 ----
+# ---- 在平台 setup 時註冊本實體的「濕度控制 / 葉片定位」服務 ----
 async def async_setup_entry(hass, entry, async_add_entities):
     host = entry.data.get("host") or entry.data.get("ip") or entry.data.get("ip_address")
     title = entry.title or f"Local Daikin ({host})"
-    ent = LocalDaikinClimate(host, name=title)
-    async_add_entities([ent], update_before_add=True)
 
-    platform = entity_platform.current_platform.get()
-    reg = hass.data.setdefault(DOMAIN, {}).get("services_registered")
-    if not reg:
+    # 1) 先註冊實體服務，避免首次 update 失敗造成服務永遠沒註冊
+    platform = entity_platform.async_get_current_platform()
+    hass.data.setdefault(DOMAIN, {})
+    if not hass.data[DOMAIN].get("services_registered"):
         hass.data[DOMAIN]["services_registered"] = True
-        # 註冊 entity service：climate.set_cool_humidity_control
+
         platform.async_register_entity_service(
             "set_cool_humidity_control",
             cv.make_entity_service_schema({
                 vol.Required("enabled"): bool,
-                vol.Optional("target"): vol.In([50, 55, 60]),
+                vol.Optional("target"): vol.All(vol.Coerce(int), vol.Range(min=0, max=100)),
                 vol.Optional("continuous", default=False): bool,
             }),
             "async_set_cool_humidity_control",
         )
 
-    # 註冊：葉片定位（至少一個參數）
-    platform.async_register_entity_service(
-        "set_vane_position",
-        cv.make_entity_service_schema({
-            vol.Optional("vertical"): vol.In([
-                "Auto","Swing","Circulation","Off",
-                "1","2","3","4","5","6",
-                "Top","Upper","Upper-Middle","Lower-Middle","Lower","Bottom",
-            ]),
-            vol.Optional("horizontal"): vol.In([
-                "Off","Swing","Left","Left-Center","Center","Right-Center","Right"
-            ]),
-        }),
-        "async_set_vane_position",
-    )
+        platform.async_register_entity_service(
+            "set_vane_position",
+            cv.make_entity_service_schema({
+                vol.Optional("vertical"): vol.In([
+                    "Auto","Swing","Circulation","Off",
+                    "1","2","3","4","5","6",
+                    "Top","Upper","Upper-Middle","Lower-Middle","Lower","Bottom",
+                ]),
+                vol.Optional("horizontal"): vol.In([
+                    "Off","Swing","Left","Left-Center","Center","Right-Center","Right"
+                ]),
+            }),
+            "async_set_vane_position",
+        )
+
+    # 2) 再加 entity（允許首次 update 失敗，但服務已經存在）
+    ent = LocalDaikinClimate(host, name=title)
+    async_add_entities([ent], update_before_add=True)

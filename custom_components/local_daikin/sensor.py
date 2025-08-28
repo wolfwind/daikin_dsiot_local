@@ -30,8 +30,15 @@ SCAN_INTERVAL = timedelta(seconds=60)
 # -------------------------
 
 def _get_host(entry: ConfigEntry) -> str:
-    host = _get_host(entry)
-    return entry.title or f"Local Daikin ({host})"
+    # 讀取 host，向下相容舊鍵名 ip/ip_address 以及 options
+    return (
+        entry.data.get("host")
+        or entry.data.get("ip")
+        or entry.data.get("ip_address")
+        or entry.options.get("host")
+        or entry.options.get("ip")
+        or entry.options.get("ip_address")
+    )
 
 def _get_title(entry: ConfigEntry) -> str:
     host = _get_host(entry)
@@ -95,10 +102,13 @@ class _BaseDaikinSensor(SensorEntity):
         return self._state
 
     def update(self) -> None:
-        """從 climate 實體的 attributes 抓最新值。"""
+        """從 climate 實體的 attributes 抓最新值，並正確標記 available。"""
         st = self._get_climate_state()
-        if not st:
+        if not st or st.state in ("unavailable", "unknown"):
+            self._attr_available = False
+            self._state = None
             return
+        self._attr_available = True
         self._update_from_state(st)
 
     # 子類覆寫
@@ -116,8 +126,8 @@ class DaikinOutdoorTempSensor(_BaseDaikinSensor):
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_outdoor_temp_{host}"
 
     def _update_from_state(self, st) -> None:
@@ -130,8 +140,8 @@ class DaikinIndoorTempSensor(_BaseDaikinSensor):
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_indoor_temp_{host}"
 
     def _update_from_state(self, st) -> None:
@@ -144,8 +154,8 @@ class DaikinCurrentHumiditySensor(_BaseDaikinSensor):
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_indoor_humidity_{host}"
 
     def _update_from_state(self, st) -> None:
@@ -159,8 +169,8 @@ class DaikinEnergyTodaySensor(_BaseDaikinSensor):
     # 今日用電：白天累積、午夜歸零
     _attr_state_class = SensorStateClass.TOTAL
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_energy_today_{host}"
 
     def _update_from_state(self, st) -> None:
@@ -173,8 +183,8 @@ class DaikinEnergyYesterdaySensor(_BaseDaikinSensor):
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_state_class = SensorStateClass.TOTAL
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_energy_yesterday_{host}"
 
     def _update_from_state(self, st) -> None:
@@ -187,8 +197,8 @@ class DaikinEnergyWeekTotalSensor(_BaseDaikinSensor):
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_state_class = SensorStateClass.TOTAL
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_energy_week_total_{host}"
 
     def _update_from_state(self, st) -> None:
@@ -201,8 +211,8 @@ class DaikinRuntimeTodaySensor(_BaseDaikinSensor):
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_runtime_today_{host}"
 
     def _update_from_state(self, st) -> None:
@@ -215,8 +225,8 @@ class DaikinTargetTempSensor(_BaseDaikinSensor):
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str) -> None:
-        super().__init__(hass, entry_id, host)
+    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
+        super().__init__(hass, entry_id, host, title)
         self._attr_unique_id = f"daikin_target_temp_{host}"
 
     def _update_from_state(self, st) -> None:
