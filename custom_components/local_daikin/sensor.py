@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import timedelta
 from typing import Any, Optional
+from homeassistant.helpers.entity import EntityCategory
 
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -25,12 +26,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(seconds=60)
 
-# -------------------------
-# Helpers
-# -------------------------
-
 def _get_host(entry: ConfigEntry) -> str:
-    # 讀取 host，向下相容舊鍵名 ip/ip_address 以及 options
     return (
         entry.data.get("host")
         or entry.data.get("ip")
@@ -49,14 +45,12 @@ def _build_device_info(host: str, title: str) -> DeviceInfo:
         identifiers={(DOMAIN, f"daikin-{host}")},
         name=title,
         manufacturer="Daikin",
-        model="Local API (/dsiot)",
+        model=f"Local API (/dsiot) @ {host}",
+        configuration_url=f"http://{host}",
     )
 
-
 class _BaseDaikinSensor(SensorEntity):
-    """Base：從 climate 的狀態機讀取資料，不主動更新對方。"""
-
-    _attr_should_poll = True  # 輕量，只讀狀態機
+    _attr_should_poll = True
     _attr_has_entity_name = True
 
     def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
@@ -67,7 +61,6 @@ class _BaseDaikinSensor(SensorEntity):
         self._climate_entity_id_cache: Optional[str] = None
         self._attr_device_info = _build_device_info(host, title)
 
-    # ---- 找到 climate entity_id 並快取 ----
     def _resolve_climate_entity_id(self) -> Optional[str]:
         if self._climate_entity_id_cache:
             return self._climate_entity_id_cache
@@ -81,14 +74,10 @@ class _BaseDaikinSensor(SensorEntity):
             if isinstance(ent, str):
                 self._climate_entity_id_cache = ent
                 return ent
-
-        # 後備方案：掃描 climate domain，找 attributes.ip == host 的
         for state in self._hass.states.async_all("climate"):
             if state.attributes.get("ip") == self._host:
                 self._climate_entity_id_cache = state.entity_id
                 break
-        if not self._climate_entity_id_cache:
-            _LOGGER.debug("Could not resolve climate entity_id for host=%s", self._host)
         return self._climate_entity_id_cache
 
     def _get_climate_state(self):
@@ -102,7 +91,6 @@ class _BaseDaikinSensor(SensorEntity):
         return self._state
 
     def update(self) -> None:
-        """從 climate 實體的 attributes 抓最新值，並正確標記 available。"""
         st = self._get_climate_state()
         if not st or st.state in ("unavailable", "unknown"):
             self._attr_available = False
@@ -111,132 +99,115 @@ class _BaseDaikinSensor(SensorEntity):
         self._attr_available = True
         self._update_from_state(st)
 
-    # 子類覆寫
     def _update_from_state(self, st) -> None:
-        raise NotImplementedError
+        self._state = None
 
-
-# -------------------------
-# Concrete sensors
-# -------------------------
+# --- Concrete sensors ---
 
 class DaikinOutdoorTempSensor(_BaseDaikinSensor):
     _attr_name = "Outdoor Temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_outdoor_temp_{host}"
-
-    def _update_from_state(self, st) -> None:
-        self._state = st.attributes.get("outside_temperature")
-
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_outdoor_temp_{host}"
+    def _update_from_state(self, st): self._state = st.attributes.get("outside_temperature")
 
 class DaikinIndoorTempSensor(_BaseDaikinSensor):
     _attr_name = "Indoor Temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_indoor_temp_{host}"
-
-    def _update_from_state(self, st) -> None:
-        self._state = st.attributes.get("current_temperature")
-
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_indoor_temp_{host}"
+    def _update_from_state(self, st): self._state = st.attributes.get("current_temperature")
 
 class DaikinCurrentHumiditySensor(_BaseDaikinSensor):
     _attr_name = "Indoor Humidity"
     _attr_device_class = SensorDeviceClass.HUMIDITY
     _attr_native_unit_of_measurement = PERCENTAGE
     _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_indoor_humidity_{host}"
-
-    def _update_from_state(self, st) -> None:
-        self._state = st.attributes.get("current_humidity") or st.attributes.get("humidity")
-
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_indoor_humidity_{host}"
+    def _update_from_state(self, st): self._state = st.attributes.get("current_humidity") or st.attributes.get("humidity")
 
 class DaikinEnergyTodaySensor(_BaseDaikinSensor):
     _attr_name = "Energy Today"
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    # 今日用電：白天累積、午夜歸零
     _attr_state_class = SensorStateClass.TOTAL
-
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_energy_today_{host}"
-
-    def _update_from_state(self, st) -> None:
-        self._state = st.attributes.get("energy_today")
-
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_energy_today_{host}"
+    def _update_from_state(self, st):
+        val = st.attributes.get("energy_today")
+        self._state = None if val in (None, 0, "0") else val
 
 class DaikinEnergyYesterdaySensor(_BaseDaikinSensor):
     _attr_name = "Energy Yesterday"
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_state_class = SensorStateClass.TOTAL
-
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_energy_yesterday_{host}"
-
-    def _update_from_state(self, st) -> None:
-        self._state = st.attributes.get("energy_yesterday")
-
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_energy_yesterday_{host}"
+    def _update_from_state(self, st):
+        val = st.attributes.get("energy_yesterday")
+        self._state = None if val in (None, 0, "0") else val
 
 class DaikinEnergyWeekTotalSensor(_BaseDaikinSensor):
     _attr_name = "Energy This Week"
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_state_class = SensorStateClass.TOTAL
-
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_energy_week_total_{host}"
-
-    def _update_from_state(self, st) -> None:
-        self._state = st.attributes.get("energy_week_total")
-
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_energy_week_total_{host}"
+    def _update_from_state(self, st):
+        val = st.attributes.get("energy_week_total")
+        self._state = None if val in (None, 0, "0") else val
 
 class DaikinRuntimeTodaySensor(_BaseDaikinSensor):
     _attr_name = "Runtime Today"
     _attr_device_class = SensorDeviceClass.DURATION
     _attr_native_unit_of_measurement = UnitOfTime.MINUTES
     _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_runtime_today_{host}"
-
-    def _update_from_state(self, st) -> None:
-        self._state = st.attributes.get("runtime_today")
-
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_runtime_today_{host}"
+    def _update_from_state(self, st): self._state = st.attributes.get("runtime_today")
 
 class DaikinTargetTempSensor(_BaseDaikinSensor):
     _attr_name = "Target Temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
     _attr_state_class = SensorStateClass.MEASUREMENT
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_target_temp_{host}"
+    def _update_from_state(self, st): self._state = st.attributes.get("target_temperature") or st.attributes.get("temperature")
 
-    def __init__(self, hass: HomeAssistant, entry_id: str, host: str, title: str) -> None:
-        super().__init__(hass, entry_id, host, title)
-        self._attr_unique_id = f"daikin_target_temp_{host}"
+class DaikinTargetHumiditySensor(_BaseDaikinSensor):
+    _attr_name = "Target Humidity"
+    _attr_device_class = SensorDeviceClass.HUMIDITY
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_target_humidity_{host}"
+    def _update_from_state(self, st):
+        self._state = (
+            st.attributes.get("cool_humidity_target")
+            or st.attributes.get("target_humidity")
+            or st.attributes.get("humidity")
+        )
 
-    def _update_from_state(self, st) -> None:
-        # climate 可能以 target_temperature 或 temperature 暴露
-        self._state = st.attributes.get("target_temperature") or st.attributes.get("temperature")
-
-
-# -------------------------
-# setup
-# -------------------------
+class DaikinHumidityControlStatusSensor(_BaseDaikinSensor):
+    _attr_name = "Humidity Control Status"
+    _attr_icon = "mdi:water-percent"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    def __init__(self, hass, entry_id, host, title): super().__init__(hass, entry_id, host, title); self._attr_unique_id=f"daikin_humidity_ctrl_status_{host}"
+    def _update_from_state(self, st):
+        preset = st.attributes.get("preset_mode")  # 兼容舊版本
+        if preset is not None:
+            self._state = "on" if str(preset).lower() == "humidity_control" else "off"
+            return
+        enabled = st.attributes.get("cool_humidity_enabled")
+        if enabled is None:
+            self._attr_available = False
+            self._state = None
+            return
+        self._state = "on" if bool(enabled) else "off"
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     host = _get_host(entry)
@@ -250,5 +221,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         DaikinEnergyYesterdaySensor(hass, entry.entry_id, host, title),
         DaikinEnergyWeekTotalSensor(hass, entry.entry_id, host, title),
         DaikinRuntimeTodaySensor(hass, entry.entry_id, host, title),
+        DaikinTargetHumiditySensor(hass, entry.entry_id, host, title),
+        DaikinHumidityControlStatusSensor(hass, entry.entry_id, host, title),
     ]
     async_add_entities(entities, update_before_add=True)
